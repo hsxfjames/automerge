@@ -2,18 +2,15 @@ const { Map, List, fromJS } = require('immutable')
 const uuid = require('./uuid')
 const { rootObjectProxy } = require('./proxies')
 const OpSet = require('./op_set')
-const {isObject, checkTarget, makeChange, makeUndo, makeRedo, merge, applyChanges} = require('./auto_api')
+const {isObject, checkTarget, makeChange, merge, applyChanges} = require('./auto_api')
 const FreezeAPI = require('./freeze_api')
 const ImmutableAPI = require('./immutable_api')
 const { Text } = require('./text')
 const transit = require('transit-immutable-js')
 
-function makeOp(state, opProps, undoOps) {
+function makeOp(state, opProps) {
   const opSet = state.get('opSet'), actor = state.get('actorId'), op = fromJS(opProps)
-  if (undoOps) {
-    undoOps = undoOps.map(op => op.remove('actor').remove('seq'))
-  }
-  let [opSet2, diff] = OpSet.addLocalOp(opSet, op, actor, undoOps)
+  let [opSet2, diff] = OpSet.addLocalOp(opSet, op, actor)
   return state.set('opSet', opSet2)
 }
 
@@ -48,16 +45,16 @@ function createNestedObjects(state, value) {
     let elemId = '_head'
     for (let i = 0; i < value.length; i++) {
       [state, elemId] = insertAfter(state, objectId, elemId)
-      state = setField(state, objectId, elemId, value[i], false)
+      state = setField(state, objectId, elemId, value[i])
     }
   } else {
     state = makeOp(state, { action: 'makeMap', obj: objectId })
-    for (let key of Object.keys(value)) state = setField(state, objectId, key, value[key], false)
+    for (let key of Object.keys(value)) state = setField(state, objectId, key, value[key])
   }
   return [state, objectId]
 }
 
-function setField(state, objectId, key, value, topLevel) {
+function setField(state, objectId, key, value) {
   if (typeof key !== 'string') {
     throw new TypeError('The key of a map entry must be a string, but ' +
                         JSON.stringify(key) + ' is a ' + (typeof key))
@@ -69,24 +66,19 @@ function setField(state, objectId, key, value, topLevel) {
     throw new TypeError('Map entries starting with underscore are not allowed: ' + key)
   }
 
-  const fieldOps = OpSet.getFieldOps(state.get('opSet'), objectId, key)
-  let undo
-  if (topLevel) {
-    undo = fieldOps.isEmpty() ? List.of(Map({action: 'del', obj: objectId, key: key})) : fieldOps
-  }
-
   if (!['object', 'boolean', 'number', 'string'].includes(typeof value)) {
     throw new TypeError('Unsupported type of value: ' + (typeof value))
   } else if (isObject(value)) {
     const [newState, newId] = createNestedObjects(state, value)
-    return makeOp(newState, { action: 'link', obj: objectId, key, value: newId }, undo)
+    return makeOp(newState, { action: 'link', obj: objectId, key, value: newId })
   } else {
     // If the assigned field value is the same as the existing value, do nothing
+    const fieldOps = OpSet.getFieldOps(state.get('opSet'), objectId, key)
     if (fieldOps.size === 1 && fieldOps.get(0).get('action') === 'set' &&
         fieldOps.get(0).get('value') === value) {
       return state
     } else {
-      return makeOp(state, { action: 'set', obj: objectId, key, value }, undo)
+      return makeOp(state, { action: 'set', obj: objectId, key, value })
     }
   }
 }
@@ -96,8 +88,7 @@ function splice(state, objectId, start, deletions, insertions) {
   for (let i = 0; i < deletions; i++) {
     let elemId = elemIds.keyOf(start)
     if (elemId) {
-      const fieldOps = OpSet.getFieldOps(state.get('opSet'), objectId, elemId)
-      state = makeOp(state, {action: 'del', obj: objectId, key: elemId}, fieldOps)
+      state = makeOp(state, {action: 'del', obj: objectId, key: elemId})
       elemIds = state.getIn(['opSet', 'byObject', objectId, '_elemIds'])
     }
   }
@@ -109,7 +100,7 @@ function splice(state, objectId, start, deletions, insertions) {
   }
   for (let ins of insertions) {
     [state, prev] = insertAfter(state, objectId, prev)
-    state = setField(state, objectId, prev, ins, true)
+    state = setField(state, objectId, prev, ins)
   }
   return state
 }
@@ -118,7 +109,7 @@ function setListIndex(state, listId, index, value) {
   const elemIds = state.getIn(['opSet', 'byObject', listId, '_elemIds'])
   const elem = elemIds.keyOf(parseListIndex(index))
   if (elem) {
-    return setField(state, listId, elem, value, true)
+    return setField(state, listId, elem, value)
   } else {
     return splice(state, listId, index, 0, [value])
   }
@@ -129,13 +120,10 @@ function deleteField(state, objectId, key) {
   if (objType === 'makeList' || objType === 'makeText') {
     return splice(state, objectId, parseListIndex(key), 1, [])
   }
-
-  const fieldOps = OpSet.getFieldOps(state.get('opSet'), objectId, key)
-  if (fieldOps.isEmpty()) {
-    return state
-  } else {
-    return makeOp(state, { action: 'del', obj: objectId, key: key }, fieldOps)
+  if (!state.hasIn(['opSet', 'byObject', objectId, key])) {
+    return state;
   }
+  return makeOp(state, { action: 'del', obj: objectId, key: key })
 }
 
 ///// Automerge.* API
@@ -200,24 +188,18 @@ function assign(target, values) {
     if (target._type === 'list') {
       state = setListIndex(state, target._objectId, key, values[key])
     } else {
-      state = setField(state, target._objectId, key, values[key], true)
+      state = setField(state, target._objectId, key, values[key])
     }
   }
   target._change.state = state
 }
 
 function load(string, actorId) {
-  const doc = FreezeAPI.init(actorId || uuid())
-  const opset = doc._state.get('opSet')
-  const changes = transit.fromJSON(string)
-  return FreezeAPI.applyChanges(doc, opset, changes, false)
+  return FreezeAPI.applyChanges(FreezeAPI.init(actorId || uuid()), transit.fromJSON(string), false)
 }
 
 function loadImmutable(string, actorId) {
-  const doc = ImmutableAPI.init(actorId || uuid())
-  const opset = doc._state.get('opSet')
-  const changes = transit.fromJSON(string)
-  return ImmutableAPI.applyChanges(doc, opset, changes, false)
+  return ImmutableAPI.applyChanges(ImmutableAPI.init(actorId || uuid()), transit.fromJSON(string), false)
 }
 
 function save(doc) {
@@ -251,8 +233,7 @@ function getHistory(doc) {
       },
       get snapshot () {
         const root = FreezeAPI.init(doc._state.get('actorId'))
-        const opset = root._state.get('opSet')
-        return FreezeAPI.applyChanges(root, opset, history.slice(0, index + 1), false)
+        return FreezeAPI.applyChanges(root, history.slice(0, index + 1), false)
       }
     }
   }).toArray()
@@ -322,38 +303,11 @@ function getMissingDeps(doc) {
   return OpSet.getMissingDeps(doc._state.get('opSet'))
 }
 
-function canUndo(doc) {
-  checkTarget('canUndo', doc)
-  return doc._state.getIn(['opSet', 'undoPos']) > 0
-}
-
-function undo(doc, message) {
-  checkTarget('undo', doc)
-  if (message !== undefined && typeof message !== 'string') {
-    throw new TypeError('Change message must be a string')
-  }
-  return makeUndo(doc, message)
-}
-
-function canRedo(doc) {
-  checkTarget('canRedo', doc)
-  return !doc._state.getIn(['opSet', 'redoStack']).isEmpty()
-}
-
-function redo(doc, message) {
-  checkTarget('redo', doc)
-  if (message !== undefined && typeof message !== 'string') {
-    throw new TypeError('Change message must be a string')
-  }
-  return makeRedo(doc, message)
-}
-
 module.exports = {
   init, change, emptyChange, merge, diff, assign, load, save, equals, inspect, getHistory,
   initImmutable, loadImmutable, getConflicts,
   getChanges, getChangesForActor, applyChanges, getMissingDeps, Text, uuid,
   getMissingChanges: OpSet.getMissingChanges,
-  canUndo, undo, canRedo, redo,
   DocSet: require('./doc_set'),
   WatchableDoc: require('./watchable_doc'),
   Connection: require('./connection')
